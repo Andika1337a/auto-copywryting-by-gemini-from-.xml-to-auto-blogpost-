@@ -1,0 +1,1 @@
+# auto-copywryting-by-gemini-from-.xml-to-auto-blogpost-
