@@ -1,0 +1,204 @@
+# -*- coding: utf-8 -*-
+
+# ==============================================================================
+# Skrip Auto Posting Konten ke Blogspot (Blogger) - Versi Mandiri
+#
+# Tidak memerlukan file client_secret.json eksternal.
+# Cukup isi kredensial di dalam variabel CLIENT_SECRETS_INFO di bawah.
+# ==============================================================================
+
+# --- DEPENDENSI ---
+# pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
+# pip install requests beautifulsoup4 tqdm lxml
+
+import os
+import pickle
+import json
+import requests
+import time
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+import google.generativeai as genai
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials # Ditambahkan untuk kompatibilitas
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+# ==============================================================================
+# --- KONFIGURASI WAJIB ---
+# Harap isi semua variabel di bawah ini dengan benar.
+# ==============================================================================
+
+# 1. Pengaturan Situs Target (Sumber Konten)
+SITEMAP_URL = "https://target.co.id/sitemap/post/2024-07.xml" 
+
+# 2. Pengaturan Gemini API
+GEMINI_API_KEY = "key" # Ganti dengan API Key Gemini Anda
+
+# 3. Pengaturan Blogspot Anda
+# Masukkan ID Blog Anda (angka panjang dari URL dashboard Blogger).
+BLOGGER_BLOG_ID = "11111111111111111"
+
+# 4. KREDENSIAL GOOGLE OAUTH (PENTING!)
+# Kredensial di bawah ini sudah diisi sesuai data Anda.
+CLIENT_SECRETS_INFO = {
+  "installed": {
+    "client_id": "111111111111111111111111.apps.googleusercontent.com",
+    "project_id": "gen-lang-client-031645611480",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_secret": "key",
+    "redirect_uris": [
+      "http://localhost"
+    ]
+  }
+}
+
+# --- PENGATURAN TAMBAHAN ---
+URL_LIMIT = 1000000 # Batasi jumlah URL yang akan diproses. Atur ke None untuk semua.
+POST_STATUS_IS_DRAFT = True # True = Simpan sebagai Draft, False = Langsung Publish
+
+# ==============================================================================
+# ANDA TIDAK PERLU MENGUBAH KODE DI BAWAH INI
+# ==============================================================================
+
+SCOPES = ['https://www.googleapis.com/auth/blogger']
+
+def get_blogger_service():
+    """
+    Melakukan otentikasi dengan akun Google dan membuat service object untuk Blogger.
+    Akan membuka browser untuk login saat pertama kali dijalankan.
+    """
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # --- PERBAIKAN DI SINI ---
+            # Menggunakan metode from_client_config yang lebih umum.
+            flow = InstalledAppFlow.from_client_config(CLIENT_SECRETS_INFO, SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+            
+    try:
+        service = build('blogger', 'v3', credentials=creds)
+        print("✅ Otentikasi ke Blogger berhasil.")
+        return service
+    except Exception as e:
+        print(f"❌ Gagal membuat service Blogger: {e}")
+        return None
+
+def configure_gemini():
+    print("⚙️  Mengkonfigurasi API Gemini...")
+    if "ganti_dengan" in GEMINI_API_KEY or not GEMINI_API_KEY:
+        print("❌ Error: Gemini API Key belum dimasukkan.")
+        return False
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("✅ Konfigurasi Gemini API berhasil.")
+    return True
+
+def get_urls_from_sitemap(sitemap_url):
+    print(f"\n🔗 Mengambil URL dari sitemap: {sitemap_url}")
+    try:
+        response = requests.get(sitemap_url, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'lxml-xml')
+        urls = [loc.text for loc in soup.find_all('loc')]
+        print(f"✅ Ditemukan {len(urls)} URL.")
+        return urls
+    except requests.RequestException as e:
+        print(f"❌ Gagal mengambil sitemap: {e}")
+        return []
+
+def scrape_article_content(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        title_text = soup.find('h1').get_text(strip=True) if soup.find('h1') else "Judul Tidak Ditemukan"
+        content_element = soup.select_one('article, .entry-content, .post-content, main') or soup.find('body')
+        for tag in content_element.select('script, style, nav, footer, header, .related-posts, .comments-area'):
+            tag.decompose()
+        content_text = ' '.join(content_element.get_text(separator=' ', strip=True).split()[:2000])
+        return {'title': title_text, 'content': content_text}
+    except requests.RequestException:
+        return None
+
+def rewrite_with_gemini(title, content):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        prompt = f'Anda adalah penulis SEO. pada saat menulis ulang artikelnya jangan sisipkan url dari link asli dan jangan ad url ke postingan yang asli. Tulis ulang artikel ini dalam format HTML. Judul Asli: "{title}". Konten Asli: "{content}". Berikan jawaban HANYA dalam format JSON: {{"new_title": "...", "new_content": "<p>...</p>"}}'
+        response = model.generate_content(prompt)
+        result = json.loads(response.text.strip().replace("```json", "").replace("```", ""))
+        return result
+    except Exception as e:
+        print(f"    -> ❌ Error saat rewrite dengan Gemini: {e}")
+        return None
+
+def post_to_blogger(service, title, content):
+    print(f"    -> 📤 Memposting judul: '{title}' ke Blogspot...")
+    try:
+        post_body = {"title": title, "content": content}
+        posts = service.posts()
+        request = posts.insert(blogId=BLOGGER_BLOG_ID, body=post_body, isDraft=POST_STATUS_IS_DRAFT)
+        response = request.execute()
+        status = "Draft" if POST_STATUS_IS_DRAFT else "Published"
+        print(f"    -> ✅ Berhasil! Postingan baru dibuat sebagai '{status}'. URL: {response['url']}")
+    except HttpError as e:
+        print(f"    -> ❌ Gagal memposting ke Blogger: {e}")
+        print(f"    -> Detail Error: {e.content}")
+
+def main():
+    print("🚀 Memulai Proses Auto-Posting Konten ke Blogspot 🚀")
+    
+    if "ganti_dengan" in BLOGGER_BLOG_ID:
+        print("\n❌ PENTING: Harap isi BLOGGER_BLOG_ID Anda di dalam skrip.")
+        return
+
+    if not configure_gemini():
+        return
+
+    blogger_service = get_blogger_service()
+    if not blogger_service:
+        print("\nSkrip berhenti karena otentikasi Blogger gagal.")
+        return
+
+    urls = get_urls_from_sitemap(SITEMAP_URL)
+    if not urls: return
+        
+    if URL_LIMIT:
+        print(f"\n⚠️ Dibatasi hanya memproses {URL_LIMIT} URL pertama.")
+        urls = urls[:URL_LIMIT]
+
+    for url in tqdm(urls, desc="⚙️  Memproses URL", unit="url"):
+        print(f"\n[ Mulai ] Proses untuk: {url}")
+        original = scrape_article_content(url)
+        if original and original['content']:
+            print("    -> ✅ Konten asli berhasil diambil.")
+            print("    -> 🧠 Mengirim ke Gemini untuk rewrite...")
+            rewritten = rewrite_with_gemini(original['title'], original['content'])
+            if rewritten:
+                print("    -> ✅ Berhasil di-rewrite oleh Gemini.")
+                post_to_blogger(blogger_service, rewritten['new_title'], rewritten['new_content'])
+            else:
+                print("    -> ❌ Gagal me-rewrite konten.")
+        else:
+            print("    -> ❌ Tidak dapat mengambil konten dari URL ini.")
+        
+        print("    -> ⏳ Jeda 5 detik...")
+        time.sleep(5)
+        
+    print("\n✨ Proses Selesai ✨")
+
+if __name__ == "__main__":
+    main()
